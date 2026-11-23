@@ -10,3 +10,4 @@ Flask>=2.2
 secure-smtplib>=0.1.1
 flask_restful>=0.3.8
 flask_cors>=6.0.2
+munch

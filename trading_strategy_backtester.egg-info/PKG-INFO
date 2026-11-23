@@ -17,6 +17,7 @@ Requires-Dist: Flask>=2.2
 Requires-Dist: secure-smtplib>=0.1.1
 Requires-Dist: flask_restful>=0.3.8
 Requires-Dist: flask_cors>=6.0.2
+Requires-Dist: munch
 
 # btBot
 

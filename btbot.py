@@ -1,218 +1,244 @@
+import os
+import signal
+import sqlite3
+import threading
+import pandas as pd
+from dotenv import load_dotenv
 from trading_ig import IGService
 from trading_ig.stream import IGStreamService, Subscription
-import time, pandas as pd
-import os
-import sqlite3
-from dotenv import load_dotenv
-from collections import defaultdict
-import signal
-import threading
-
-stop_event = threading.Event()
-
-def handle_sigint(sig, frame):
-    print("Shutting down...")
-    stop_event.set()
-
-signal.signal(signal.SIGINT, handle_sigint)
 
 load_dotenv()
 
+stop_event = threading.Event()
+
+
+def handle_sigint(sig, frame):
+    print("\nShutting down...")
+    stop_event.set()
+
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+
 # ---------------------------------------
-# DB STORAGE (simplified schema)
+# DB STORAGE
 # ---------------------------------------
-def store_to_db(ohlc):
-    db = sqlite3.connect('btbot.db')
-    c = db.cursor()
-    try:
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS price_data (
-                epic TEXT,
-                date TEXT,
-                scale TEXT,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                PRIMARY KEY (epic, date, scale)
+class CandleStore:
+    def __init__(self, db_path="btbot.db"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        with self.lock:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS price_data (
+                    epic TEXT,
+                    date TEXT,
+                    scale TEXT,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    PRIMARY KEY (epic, date, scale)
+                )
+                """
             )
-        ''')
+            self.conn.commit()
 
-        c.execute('''
-            INSERT OR REPLACE INTO price_data 
-            (epic, date, scale, open, high, low, close)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            ohlc['epic'], ohlc['date'], ohlc['scale'],
-            ohlc['open'], ohlc['high'], ohlc['low'], ohlc['close']
-        ))
+    def write(self, ohlc):
 
-        db.commit()
-    except Exception as e:
-        print("DB error:", e)
-    finally:
-        db.close()
+        with self.lock:
+            try:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO price_data
+                    (epic, date, scale, open, high, low, close)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ohlc["epic"],
+                        ohlc["date"],
+                        ohlc["scale"],
+                        ohlc["open"],
+                        ohlc["high"],
+                        ohlc["low"],
+                        ohlc["close"],
+                    ),
+                )
+                self.conn.commit()
+            except Exception as e:
+                print("DB error:", e)
+
+    def close(self):
+        with self.lock:
+            self.conn.close()
 
 
 # ---------------------------------------
-# TICK → CANDLE AGGREGATOR
+# TICK -> CANDLE AGGREGATOR
 # ---------------------------------------
 class TickAggregator:
-    """
-    Builds 1-minute and 5-minute candles from MARKET ticks.
-    """
+    """Builds 1-minute and 5-minute OHLC candles from mid-price ticks."""
 
     def __init__(self, store_func):
         self.store = store_func
+        self.lock = threading.Lock()
         self.current_1m = {}
         self.current_5m = {}
         self.last_5m_bucket = {}
 
+    @staticmethod
+    def _new_candle(epic, bucket_ts, scale, mid):
+        return {
+            "epic": epic,
+            "date": bucket_ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "scale": scale,
+            "open": mid,
+            "high": mid,
+            "low": mid,
+            "close": mid,
+        }
+
     def process_tick(self, epic, bid, offer, ts):
-        mid = (bid + offer) / 2
-        minute_ts = ts.replace(second=0, microsecond=0)
+        mid = (bid + offer) / 2.0
+        ts_1m = ts.replace(second=0, microsecond=0)
+        ts_5m = ts.replace(minute=ts.minute - (ts.minute % 5), second=0, microsecond=0)
 
+        with self.lock:
+            # 1-minute candle
+            c1 = self.current_1m.get(epic)
+            label_1m = ts_1m.strftime("%Y-%m-%d %H:%M:%S")
+            if c1 is None:
+                self.current_1m[epic] = self._new_candle(epic, ts_1m, "1MINUTE", mid)
+            elif c1["date"] != label_1m:
+                self.store(c1)
+                self.current_1m[epic] = self._new_candle(epic, ts_1m, "1MINUTE", mid)
+            else:
+                c1["high"] = max(c1["high"], mid)
+                c1["low"] = min(c1["low"], mid)
+                c1["close"] = mid
 
-        # -------------------------
-        # 1-MINUTE CANDLE
-        # -------------------------
-        if epic not in self.current_1m:
-            # Start new candle
-            self.current_1m[epic] = {
-                "epic": epic,
-                "date": minute_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "scale": "1MINUTE",
-                "open": mid,
-                "high": mid,
-                "low": mid,
-                "close": mid
-            }
-        else:
-            c = self.current_1m[epic]
-            if c["date"] != minute_ts.strftime("%Y-%m-%d %H:%M:%S"):
-                # Close previous candle
+            # 5-minute candle
+            c5 = self.current_5m.get(epic)
+            if c5 is None:
+                self.current_5m[epic] = self._new_candle(epic, ts_5m, "5MINUTE", mid)
+                self.last_5m_bucket[epic] = ts_5m
+            elif ts_5m != self.last_5m_bucket[epic]:
+                self.store(c5)
+                self.current_5m[epic] = self._new_candle(epic, ts_5m, "5MINUTE", mid)
+                self.last_5m_bucket[epic] = ts_5m
+            else:
+                c5["high"] = max(c5["high"], mid)
+                c5["low"] = min(c5["low"], mid)
+                c5["close"] = mid
+
+    def flush(self):
+        with self.lock:
+            for c in list(self.current_1m.values()):
                 self.store(c)
-                # Start new candle
-                self.current_1m[epic] = {
-                    "epic": epic,
-                    "date": minute_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                    "scale": "1MINUTE",
-                    "open": mid,
-                    "high": mid,
-                    "low": mid,
-                    "close": mid
-                }
-            else:
-                # Update candle
-                c["high"] = max(c["high"], mid)
-                c["low"] = min(c["low"], mid)
-                c["close"] = mid
-
-        # -------------------------
-        # 5-MINUTE CANDLE
-        # -------------------------
-        bucket_minute = ts.minute - (ts.minute % 5)
-        bucket_ts = ts.replace(minute=bucket_minute, second=0, microsecond=0)
-
-        if epic not in self.current_5m:
-            self.current_5m[epic] = {
-                "epic": epic,
-                "date": bucket_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "scale": "5MINUTE",
-                "open": mid,
-                "high": mid,
-                "low": mid,
-                "close": mid
-            }
-            self.last_5m_bucket[epic] = bucket_ts
-        else:
-            if bucket_ts != self.last_5m_bucket[epic]:
-                # Close previous 5m candle
-                self.store(self.current_5m[epic])
-                # Start new bucket
-                self.current_5m[epic] = {
-                    "epic": epic,
-                    "date": bucket_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                    "scale": "5MINUTE",
-                    "open": mid,
-                    "high": mid,
-                    "low": mid,
-                    "close": mid
-                }
-                self.last_5m_bucket[epic] = bucket_ts
-            else:
-                c = self.current_5m[epic]
-                c["high"] = max(c["high"], mid)
-                c["low"] = min(c["low"], mid)
-                c["close"] = mid
+            for c in list(self.current_5m.values()):
+                self.store(c)
+            self.current_1m.clear()
+            self.current_5m.clear()
+            self.last_5m_bucket.clear()
 
 
 # ---------------------------------------
-# MARKET STREAM LISTENER
+# PRICE STREAM LISTENER
 # ---------------------------------------
 class MarketListener:
     def __init__(self, aggregator):
         self.agg = aggregator
 
     def onSubscription(self):
-        print("📡 MARKET subscription active")
+        print("📡 PRICE subscription active")
+
+    def onSubscriptionError(self, code, message):
+        print(f"❌ Subscription error {code}: {message}")
 
     def onItemUpdate(self, update):
-        item_name = update.getItemName()
         try:
-            _, epic = item_name.split(":")
-        except ValueError:
-            print("Bad item:", item_name)
-            return
+            item_name = update.getItemName()
+            _, epic = item_name.rsplit(":", 1)
 
-        bid = float(update.getValue("BID"))
-        offer = float(update.getValue("OFFER"))
-        ts_raw = update.getValue("UPDATE_TIME")
+            bid_raw = update.getValue("BIDPRICE1") or update.getValue("BID")
+            offer_raw = update.getValue("ASKPRICE1") or update.getValue("OFFER")
+            ts_raw = update.getValue("TIMESTAMP") or update.getValue("UPDATE_TIME")
 
-        if bid is None or offer is None or ts_raw is None:
-            print("⚠️ Missing fields in tick:", update.getFields())
-            return
+            if bid_raw is None or offer_raw is None:
+                return
 
-        bid = float(bid)
-        offer = float(offer)
+            bid = float(bid_raw)
+            offer = float(offer_raw)
 
-        # Convert UPDATE_TIME (string like "2025-01-01T12:34:56.789")
-        ts = pd.to_datetime(ts_raw)
+            if ts_raw is not None and str(ts_raw).strip().isdigit():
+                ts = pd.to_datetime(int(ts_raw), unit="ms", utc=True)
+            elif ts_raw:
+                ts = pd.to_datetime(ts_raw, utc=True)
+            else:
+                ts = pd.Timestamp.now(tz="UTC")
 
-        self.agg.process_tick(epic, bid, offer, ts)
+            self.agg.process_tick(epic, bid, offer, ts)
+        except Exception as e:
+            print(f"❌ Error in onItemUpdate: {e}")
 
     def onItemLostUpdates(self, item, lost, key):
         print(f"⚠️ Lost {lost} updates for {item}")
 
 
 # ---------------------------------------
-# IG LOGIN + STREAM SETUP
+# MAIN
 # ---------------------------------------
-ig_service = IGService(
-    username=os.getenv("IDENTIFIER"),
-    password=os.getenv("PASSWORD"),
-    api_key=os.getenv("API_KEY"),
-    acc_type=os.getenv("ACC_TYPE")
-)
+def main():
+    store = CandleStore("btbot.db")
+    aggregator = TickAggregator(store.write)
 
-ig_service.lightstreamer_endpoint = os.getenv("LIGHTSTREAM_URL")
+    ig_service = IGService(
+        username=os.getenv("IDENTIFIER"),
+        password=os.getenv("PASSWORD"),
+        api_key=os.getenv("API_KEY"),
+        acc_type=os.getenv("ACC_TYPE"),
+    )
 
-stream_svc = IGStreamService(ig_service)
-stream_svc.create_session()
-stream_svc.ls_client.connect()
+    session_info = ig_service.create_session() or {}
+    acc_number = (
+        session_info.get("currentAccountId")
+        or getattr(ig_service, "acc_number", None)
+        or os.getenv("ACC_NUMBER")
+    )
+    if not acc_number:
+        raise RuntimeError(
+            "Could not determine account ID from create_session(); set ACC_NUMBER in .env if needed."
+        )
 
-# MARKET subscription
-epics = ['IX.D.FTSE.DAILY.IP', 'CS.D.USCGC.TODAY.IP', 'IX.D.DOW.DAILY.IP']
-items = [f"MARKET:{epic}" for epic in epics]
+    stream_svc = IGStreamService(ig_service)
+    stream_svc.create_session()
 
-fields = ["BID", "OFFER", "UPDATE_TIME"]
+    epics = ["IX.D.FTSE.DAILY.IP", "CS.D.USCGC.TODAY.IP", "IX.D.DOW.DAILY.IP"]
+    fields = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP"]
 
-sub = Subscription("MERGE", items, fields)
-sub.addListener(MarketListener(TickAggregator(store_to_db)))
+    for epic in epics:
+        item = f"PRICE:{acc_number}:{epic}"
+        sub = Subscription(mode="MERGE", items=[item], fields=fields)
+        sub.setDataAdapter("Pricing")
+        sub.addListener(MarketListener(aggregator))
+        stream_svc.subscribe(sub)
 
-stream_svc.ls_client.subscribe(sub)
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nInterrupted via KeyboardInterrupt...")
+        stop_event.set()
+    finally:
+        aggregator.flush()
+        stream_svc.disconnect()
+        store.close()
+        print("Disconnected cleanly")
 
-stop_event.wait()
 
-stream_svc.ls_client.disconnect()
-print("Disconnected cleanly")
+if __name__ == "__main__":
+    main()
