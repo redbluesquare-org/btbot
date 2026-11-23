@@ -3,6 +3,7 @@ import pandas as pd
 import time
 import os
 import smtplib
+from datetime import datetime
 from dotenv import load_dotenv
 from email.mime.multipart import MIMEMultipart
 from email.mime.text      import MIMEText
@@ -100,13 +101,16 @@ def send_email(to_addr, subject, html_body):
 
 def main():
     html_header, html_body = getTradeData()
-    try:
-        send_email(
-            to_addr    = 'usher_darryl@hotmail.com',
-            subject    = "Daily Trade Summary",
-            html_body  = html_header+'<br><br>'+html_body
-        )
-        print(f"✔ Sent to {'usher_darryl@hotmail.com'}")
-    except Exception as e:
-        print(f"✖ Failed for {'usher_darryl@hotmail.com'}: {e}")
-    time.sleep(1)
+    if datetime.now().weekday() < 5:  # Check if today is a weekday (0-4):
+        try:
+            send_email(
+                to_addr    = 'usher_darryl@hotmail.com',
+                subject    = "Daily Trade Summary",
+                html_body  = html_header+'<br><br>'+html_body
+            )
+            print(f"✔ Sent to {'usher_darryl@hotmail.com'}")
+        except Exception as e:
+            print(f"✖ Failed for {'usher_darryl@hotmail.com'}: {e}")
+        time.sleep(1)
+    else:
+        time.sleep(60)
